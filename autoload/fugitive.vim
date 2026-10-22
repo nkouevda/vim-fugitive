@@ -7274,10 +7274,48 @@ function! s:BlameJump(suffix, ...) abort
 endfunction
 
 let s:hash_colors = {}
+let s:time_colors = {}
+" Default/iso (with or without time) and raw dates, followed by the line number
+let s:blame_date_pattern = '\<\%(\d\{4\}-\d\d-\d\d\%( \d\d:\d\d:\d\d [+-]\d\{4\}\)\=\|\d\+ [+-]\d\{4\}\)\%(\s\+\d\+)\)\@='
+
+function! s:BlameTimeSyntax(dir, dates) abort
+  let [lines, exec_error] = s:LinesError([a:dir, 'log', '--no-walk', '--stdin', '--format=%H %at'] +
+        \ (fugitive#GitVersion(2, 10) ? ['--no-show-signature'] : []), {'stdin': keys(a:dates) + ['']})
+  let lengths = uniq(sort(map(keys(a:dates), 'len(v:val)'), 'n'))
+  let times = {}
+  for line in exec_error ? [] : lines
+    let match = matchlist(line, '^\(\x\+\) \(\d\+\)$')
+    for length in empty(match) ? [] : lengths
+      let date = get(a:dates, match[1][0 : length - 1], '')
+      if !empty(date)
+        let times[date] = max([get(times, date, 0), str2nr(match[2])])
+      endif
+    endfor
+  endfor
+  let sorted = uniq(sort(values(times), 'n'))
+  let ranks = {}
+  for i in range(len(sorted))
+    let ranks[sorted[i]] = i
+  endfor
+  for [date, time] in items(times)
+    " Interpolate from gray (oldest) to green (newest), evenly spaced by rank
+    let ratio = len(sorted) > 1 ? ranks[time] * 1.0 / (len(sorted) - 1) : 1.0
+    let rgb = map([[128, 64], [128, 255], [128, 64]], 'float2nr(round(v:val[0] + (v:val[1] - v:val[0]) * ratio))')
+    let color = printf('%02x%02x%02x', rgb[0], rgb[1], rgb[2])
+    if &t_Co == 256
+      let [r, g, b] = map(copy(rgb), 'v:val < 48 ? 0 : v:val < 115 ? 1 : (v:val - 35) / 40')
+      let s:time_colors[color] = ' ctermfg=' . (16 + r * 36 + g * 6 + b)
+    else
+      let s:time_colors[color] = ''
+    endif
+    exe 'syn match FugitiveblameTime'.color.' "\<\V'.date.'\m\%(\s\+\d\+)\)\@=" contained containedin=FugitiveblameAnnotation'
+  endfor
+endfunction
 
 function! fugitive#BlameSyntax() abort
   let conceal = has('conceal') ? ' conceal' : ''
-  let flags = get(s:TempState(), 'blame_flags', [])
+  let state = s:TempState()
+  let flags = get(state, 'blame_flags', [])
   syn spell notoplevel
   syn match FugitiveblameBlank                      "^\s\+\s\@=" nextgroup=FugitiveblameAnnotation,FugitiveblameScoreDebug,FugitiveblameOriginalFile,FugitiveblameOriginalLineNumber skipwhite
   syn match FugitiveblameHash       "\%(^\^\=[?*]*\)\@<=\<\x\{7,\}\>" nextgroup=FugitiveblameAnnotation,FugitiveblameScoreDebug,FugitiveblameOriginalLineNumber,FugitiveblameOriginalFile skipwhite
@@ -7314,8 +7352,15 @@ function! fugitive#BlameSyntax() abort
   for x in split('01234567890abcdef', '\zs')
     exe 'syn match FugitiveblameHashGroup'.x '"\%(^\^\=[*?]*\)\@<='.x.'\x\{5,\}\>" nextgroup=FugitiveblameAnnotation,FugitiveblameOriginalLineNumber,fugitiveblameOriginalFile skipwhite'
   endfor
+  let dates = {}
   for lnum in range(1, line('$'))
-    let orig_hash = matchstr(getline(lnum), '^\^\=[*?]*\zs\x\{6\}')
+    let line = getline(lnum)
+    let date = matchstr(line, s:blame_date_pattern)
+    let full_hash = matchstr(line, '^\^\=[*?]*\zs\x\{7,\}')
+    if full_hash !~# '^0*$' && !empty(date)
+      let dates[full_hash] = date
+    endif
+    let orig_hash = matchstr(line, '^\^\=[*?]*\zs\x\{6\}')
     let hash = orig_hash
     let hash = substitute(hash, '\(\x\)\x', '\=submatch(1).printf("%x", 15-str2nr(submatch(1),16))', 'g')
     let hash = substitute(hash, '\(\x\x\)', '\=printf("%02x", str2nr(submatch(1),16)*3/4+32)', 'g')
@@ -7338,17 +7383,23 @@ function! fugitive#BlameSyntax() abort
     let pattern = substitute(orig_hash, '^\(\x\)\x\(\x\)\x\(\x\)\x$', '\1\\x\2\\x\3\\x', '') . '*'
     exe 'syn match FugitiveblameHash'.hash.'       "\%(^\^\=[*?]*\)\@<='.pattern.'" contained containedin=FugitiveblameHashGroup' . orig_hash[0]
   endfor
+  if !empty(dates) && has_key(state, 'git_dir') &&
+        \ (&t_Co == 256 || has('gui_running') || has('termguicolors') && &termguicolors)
+    call s:BlameTimeSyntax(state.git_dir, dates)
+  endif
   syn match FugitiveblameUncommitted "\%(^\^\=[?*]*\)\@<=\<0\{7,\}\>" nextgroup=FugitiveblameAnnotation,FugitiveblameScoreDebug,FugitiveblameOriginalLineNumber,FugitiveblameOriginalFile skipwhite
   call s:BlameRehighlight()
 endfunction
 
 function! s:BlameRehighlight() abort
-  for [hash, cterm] in items(s:hash_colors)
-    if !empty(cterm) || has('gui_running') || has('termguicolors') && &termguicolors
-      exe 'hi FugitiveblameHash'.hash.' guifg=#' . hash . cterm
-    else
-      exe 'hi link FugitiveblameHash'.hash.' Identifier'
-    endif
+  for [group, colors, default] in [['Hash', s:hash_colors, 'Identifier'], ['Time', s:time_colors, 'FugitiveblameTime']]
+    for [color, cterm] in items(colors)
+      if !empty(cterm) || has('gui_running') || has('termguicolors') && &termguicolors
+        exe 'hi Fugitiveblame'.group.color.' guifg=#' . color . cterm
+      else
+        exe 'hi link Fugitiveblame'.group.color.' '.default
+      endif
+    endfor
   endfor
 endfunction
 
